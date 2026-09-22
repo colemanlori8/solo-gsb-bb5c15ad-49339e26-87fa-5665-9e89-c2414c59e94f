@@ -17,6 +17,10 @@ from .serial import (
     IXFR,
     UP_TO_DATE,
 )
+from .scenarios import (
+    MAX_GENERATE_REPLICAS,
+    SCENARIO_LABELS,
+)
 
 Serial32 = Annotated[int, Field(ge=0, le=MAX_SERIAL)]
 Relation = Literal["newer", "equal", "older", "ambiguous"]
@@ -1267,4 +1271,159 @@ class DeltaConsensusResponse(BaseModel):
     )
     mirrors: List[ConsensusMirrorEvidence] = Field(
         ..., description="逐镜像证据（顺序与请求中的镜像一致）",
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /serial-scenarios/generate
+# ---------------------------------------------------------------------------
+
+ScenarioLabel = Literal["wrap", "ambiguous", "fork", "loop"]
+
+
+class SerialScenarioGenerateRequest(BaseModel):
+    """POST /serial-scenarios/generate 请求体。"""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "seed": 20240921,
+                    "replica_count": 4,
+                    "scenario_count": 4,
+                    "include": ["wrap", "ambiguous", "fork", "loop"],
+                },
+                {
+                    "seed": 7,
+                    "replica_count": 2,
+                    "scenario_count": 2,
+                    "include": ["wrap", "loop"],
+                },
+            ]
+        }
+    )
+
+    seed: int = Field(
+        ...,
+        description=(
+            "确定性随机种子（非负 32 位无符号整数）；相同 seed 与其余参数"
+            "恒得完全相同的场景、副本、目标与增量"
+        ),
+    )
+    replica_count: int = Field(
+        ...,
+        ge=1,
+        le=MAX_GENERATE_REPLICAS,
+        description=f"要生成的副本序列长度（1..{MAX_GENERATE_REPLICAS}）",
+    )
+    scenario_count: int = Field(
+        ...,
+        ge=1,
+        le=len(SCENARIO_LABELS),
+        description=(
+            "要生成的场景数量（1..include 去重后的标签数）；"
+            "场景按 ambiguous < fork < loop < wrap 的固定规范顺序从 include 中选取"
+        ),
+    )
+    include: List[ScenarioLabel] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "候选场景标签集合（至少一个；未知标签返回 422，"
+            "重复标签返回 422 duplicate_scenario_label）"
+        ),
+    )
+
+    @field_validator("seed", mode="before")
+    @classmethod
+    def _seed_serial32(cls, value: object) -> int:
+        return _coerce_serial32(value)
+
+    @field_validator("replica_count", "scenario_count", mode="before")
+    @classmethod
+    def _counts_positive_int(cls, value: object) -> int:
+        return _coerce_non_negative_int(value, "数量参数")
+
+
+class ScenarioReplica(BaseModel):
+    """生成场景中的单个副本（名称与当前 32 位序列号）。"""
+
+    name: str = Field(..., description="副本名称：ns-1、ns-2、…（与槽位同序）")
+    current: int = Field(..., description="确定性生成的当前 32 位无符号 SOA 序列号")
+
+
+class ScenarioDelta(BaseModel):
+    """一条无序 IXFR 增量样本（结构与 /transfer-plan 的输入增量一致）。"""
+
+    from_serial: int
+    to_serial: int
+
+
+class TriggerDelta(BaseModel):
+    """触发点中涉及的单条增量及其 RFC 1982 关系（便于直接定位边界）。"""
+
+    from_serial: int
+    to_serial: int
+    forward_distance: int = Field(
+        ..., ge=0, le=MAX_SERIAL,
+        description="(to_serial - from_serial) mod 2^32",
+    )
+    relation: Relation = Field(
+        ...,
+        description=(
+            "该增量按 RFC 1982 的关系：wrap 为 newer；ambiguous 为 ambiguous；"
+            "fork / loop 的每条边单独看为 newer（整体才构成分叉 / 环路）"
+        ),
+    )
+
+
+class ScenarioTrigger(BaseModel):
+    """单个场景的触发点说明：涉及增量、锚定副本与预期判定。"""
+
+    label: ScenarioLabel
+    title: str = Field(..., description="场景中文名称")
+    description: str = Field(
+        ..., description="触发点中文说明：边界位置、涉及序列号与在各接口上的预期判定",
+    )
+    deltas: List[TriggerDelta] = Field(
+        ..., description="触发该场景的增量（含前向距离与 RFC 1982 关系）",
+    )
+    replica: Optional[str] = Field(
+        ...,
+        description=(
+            "锚定在该场景关键序列号上的副本名；副本数不足而未锚定时为 null"
+        ),
+    )
+
+
+class SerialScenarioGenerateResponse(BaseModel):
+    """POST /serial-scenarios/generate 响应体。"""
+
+    seed: int
+    replica_count: int
+    scenario_count: int
+    include: List[ScenarioLabel] = Field(
+        ...,
+        description="回显 include 并按固定规范顺序（ambiguous、fork、loop、wrap）排列",
+    )
+    scenarios: List[ScenarioLabel] = Field(
+        ...,
+        description=(
+            "实际生成的场景标签（按固定规范顺序：ambiguous、fork、loop、wrap"
+            "中被选中者的规范先后）；相同输入恒得相同顺序"
+        ),
+    )
+    replicas: List[ScenarioReplica] = Field(
+        ..., description="生成的副本序列（ns-1 起，锚点副本占据靠前槽位）",
+    )
+    target: int = Field(..., description="确定性生成的目标 32 位无符号 SOA 序列号")
+    deltas: List[ScenarioDelta] = Field(
+        ...,
+        description=(
+            "无序增量样本（整体已乱序；包含选中场景的边界增量与一条普通背景链），"
+            "可直接作为 /transfer-plan 等接口的 deltas 输入"
+        ),
+    )
+    triggers: List[ScenarioTrigger] = Field(
+        ..., description="各场景触发点说明（顺序与 scenarios 一致）",
     )

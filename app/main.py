@@ -45,9 +45,15 @@ from .schemas import (
     RolloutGateResponse,
     RolloutInterval,
     RolloutReplicaItem,
+    ScenarioDelta,
+    ScenarioReplica,
+    ScenarioTrigger,
+    SerialScenarioGenerateRequest,
+    SerialScenarioGenerateResponse,
     TransferPlanItem,
     TransferPlanRequest,
     TransferPlanResponse,
+    TriggerDelta,
 )
 from .serial import (
     MAX_RETENTION_REPLICAS,
@@ -72,6 +78,7 @@ from .serial import (
     ReleaseOrderError,
     validate_mirror_reports,
 )
+from .scenarios import generate_serial_scenarios
 
 app = FastAPI(
     title="DNS SOA 序列号推进审计 API",
@@ -82,9 +89,11 @@ app = FastAPI(
         "并按时间序列观测对上线做 quorum 门禁判定、"
         "评估每次发布在各故障域间的传播收敛时延（SLO），"
         "沿时间线检测各副本序列号无可共同推进候选的分裂窗口，"
-        "以及对多镜像上报的 IXFR 增量按完整三元组做法定人数共识审计。"
+        "对多镜像上报的 IXFR 增量按完整三元组做法定人数共识审计，"
+        "并确定性生成覆盖 RFC 1982 边界（回绕 / 正对点 / 分叉 / 环路）"
+        "的可复现测试场景。"
     ),
-    version="1.6.0",
+    version="1.7.0",
 )
 
 
@@ -766,5 +775,110 @@ def delta_consensus(request: DeltaConsensusRequest) -> DeltaConsensusResponse:
                 ],
             )
             for item in outcome["mirrors"]
+        ],
+    )
+
+
+@app.post(
+    "/serial-scenarios/generate",
+    response_model=SerialScenarioGenerateResponse,
+)
+def generate_serial_scenarios_endpoint(
+    request: SerialScenarioGenerateRequest,
+) -> SerialScenarioGenerateResponse:
+    """确定性生成覆盖 RFC 1982 边界的可复现测试场景。
+
+    给定非负 32 位 ``seed``、``replica_count``（1..12）、
+    ``scenario_count``（1..4）与候选标签集合 ``include``
+    （``wrap`` / ``ambiguous`` / ``fork`` / ``loop`` 的非空子集，
+    重复或未知标签返回 422），
+    以 seed 为唯一随机性来源（内置 64 位 SplitMix64，不读取系统随机源）
+    生成：
+
+    * ``scenarios``：按固定规范顺序（ambiguous → fork → loop → wrap）从
+      include 中选出的场景标签——include 的给出顺序不影响结果；
+    * ``replicas``：``ns-1`` 起的副本序列，靠前槽位依次锚定各场景的关键
+      序列号（如 ambiguous 场景锚定在与目标相差正好 2³¹ 的正对点）；
+    * ``target``：目标 32 位无符号 SOA 序列号；
+    * ``deltas``：**无序** IXFR 增量样本（整体已乱序），包含选中场景的
+      边界增量——``wrap`` 为跨 2³² 回绕的合法 newer 边，``ambiguous``
+      为前向距离恰 2³¹ 的不可比较边，``fork`` 为同一 from_serial 的两条
+      严格推进边，``loop`` 为三条各自严格 newer、距离之和恰 2³² 的
+      回绕环——外加一条普通背景增量链；
+    * ``triggers``：逐场景给出触发点说明（涉及增量、前向距离 / RFC 1982
+      关系、锚定副本与在各接口上的预期判定）。
+
+    相同请求（seed / replica_count / scenario_count / include 相同）恒得
+    完全相同的输出，便于固化回归用例。非法参数（空 include、重复或未知
+    标签、scenario_count 超过 include 去重标签数或 4、replica_count
+    超过 12、seed / 数量越界或类型错误）返回 422。
+    """
+    include = list(request.include)
+
+    if len(include) != len(set(include)):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "duplicate_scenario_label",
+                "message": "include 中的场景标签不可重复（重复请去重）",
+                "include": include,
+            },
+        )
+
+    unique_count = len(set(include))
+    if request.scenario_count > unique_count:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "scenario_count_exceeds_include",
+                "message": (
+                    "scenario_count 不得超过 include 去重后的标签数"
+                ),
+                "scenario_count": request.scenario_count,
+                "include_count": unique_count,
+            },
+        )
+
+    outcome = generate_serial_scenarios(
+        seed=request.seed,
+        replica_count=request.replica_count,
+        scenario_count=request.scenario_count,
+        include=include,
+    )
+
+    return SerialScenarioGenerateResponse(
+        seed=outcome["seed"],
+        replica_count=outcome["replica_count"],
+        scenario_count=outcome["scenario_count"],
+        include=outcome["include"],
+        scenarios=outcome["scenarios"],
+        replicas=[
+            ScenarioReplica(name=item["name"], current=item["current"])
+            for item in outcome["replicas"]
+        ],
+        target=outcome["target"],
+        deltas=[
+            ScenarioDelta(
+                from_serial=item["from_serial"], to_serial=item["to_serial"]
+            )
+            for item in outcome["deltas"]
+        ],
+        triggers=[
+            ScenarioTrigger(
+                label=item["label"],
+                title=item["title"],
+                description=item["description"],
+                deltas=[
+                    TriggerDelta(
+                        from_serial=edge["from_serial"],
+                        to_serial=edge["to_serial"],
+                        forward_distance=edge["forward_distance"],
+                        relation=edge["relation"],
+                    )
+                    for edge in item["deltas"]
+                ],
+                replica=item["replica"],
+            )
+            for item in outcome["triggers"]
         ],
     )

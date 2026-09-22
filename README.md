@@ -8,7 +8,9 @@
 评估每次发布在各故障域间的传播收敛时延（SLO），
 沿时间线检测各副本序列号无可共同推进候选的分裂窗口，
 以及对多个镜像上报的无序 IXFR 清单按完整三元组（含内容摘要）
-做法定人数计票与可信链共识审计。
+做法定人数计票与可信链共识审计，
+并按种子确定性生成覆盖 RFC 1982 边界（回绕 / 正对点 / 分叉 / 环路）
+的可复现测试场景（副本序列、目标与无序增量样本）。
 
 ## 一条命令启动（Docker Compose）
 
@@ -920,6 +922,139 @@ curl -s http://localhost:8000/delta-consensus \
 为空、`target_reachable=false`、`chain_reason="gap"`，所有上报按票数计入
 `extra_edges`）。
 
+### `POST /serial-scenarios/generate` — 确定性生成 RFC 1982 边界测试场景
+
+按给定 **种子** 确定性生成一组可直接喂给上述接口的测试输入：满足 RFC 1982
+边界语义的副本序列号序列、目标序列号与一组**无序** IXFR 增量样本，覆盖
+四类场景标签：
+
+| 标签 | 生成内容 | 边界语义 |
+|---|---|---|
+| `wrap` | 一条贴近 `2³²-1` 的增量（如 `4294967294 -> 2`） | 越过回绕点但前向距离很小，RFC 1982 仍判定 `newer`，是合法 IXFR 跳 |
+| `ambiguous` | 锚点副本与 `target` 前向距离**恰为 2³¹**，增量 `锚点 -> target` | 正对点不可比较：`/audit` 为 `ambiguous`、`/propose` 为 409；该增量在各增量接口为 422 `delta_not_strictly_newer` |
+| `fork` | 同一 `from_serial` 出发的两条短距离严格推进边 | 单条均 `newer`，但整体为 422 `delta_fork`（链不允许分叉） |
+| `loop` | 三条各自严格 newer、前向距离之和恰为 `2³²` 的回绕环（`s1 -> s2 -> s3 -> s1`） | 两条严格 newer 边距离之和至多 `2³²-2`，故合法环至少需要三条边；`/transfer-plan` 沿边回到已访问序列号，`axfr / loop` |
+
+请求参数：
+
+- `seed`：非负 32 位无符号整数（`0..4294967295`），随机性的**唯一**来源
+  （服务内置 64 位 SplitMix64，不读系统时间或全局随机源）；
+- `replica_count`：副本数 `1..12`；
+- `scenario_count`：要生成的场景数 `1..4`，且不得超过 `include` 去重后的标签数；
+- `include`：候选场景标签集合（至少一个；取值 `wrap` / `ambiguous` /
+  `fork` / `loop`，重复标签去重，未知标签返回 422）。实际生成的场景按
+  **固定规范顺序** `ambiguous → fork → loop → wrap` 从 `include` 中取前
+  `scenario_count` 个——因此 `include` 的给出顺序不影响结果。
+
+> 相同请求（`seed` / `replica_count` / `scenario_count` / `include` 相同）
+> 恒得完全相同的场景标签、副本序列、目标与无序增量，适合固化为回归用例。
+> 靠前的副本槽（`ns-1`、`ns-2`、…）依次锚定各生成场景的关键序列号
+> （如正对点、分叉起点、环上节点、回绕边起点）；副本数不足时靠后的场景
+> 只保留增量证据，其触发点 `replica` 为 `null`。
+
+请求：
+
+```bash
+curl -s http://localhost:8000/serial-scenarios/generate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "seed": 20240921,
+    "replica_count": 4,
+    "scenario_count": 4,
+    "include": ["wrap", "ambiguous", "fork", "loop"]
+  }'
+```
+
+响应（数值由种子确定；`deltas` 已整体乱序为无序样本，并额外含一条普通
+背景增量链，`triggers` 与 `scenarios` 同序，给出触发点的具体序列号、
+前向距离、RFC 1982 关系、锚定副本与在各接口上的预期判定）：
+
+```json
+{
+  "seed": 20240921,
+  "replica_count": 4,
+  "scenario_count": 4,
+  "include": ["ambiguous", "fork", "loop", "wrap"],
+  "scenarios": ["ambiguous", "fork", "loop", "wrap"],
+  "replicas": [
+    {"name": "ns-1", "current": 936405171},
+    {"name": "ns-2", "current": 2526521020},
+    {"name": "ns-3", "current": 2204289864},
+    {"name": "ns-4", "current": 4294967292}
+  ],
+  "target": 3083888819,
+  "deltas": [
+    {"from_serial": 4294967292, "to_serial": 2},
+    {"from_serial": 56806203, "to_serial": 2204289840},
+    {"from_serial": 936405171, "to_serial": 3083888819},
+    {"from_serial": 2182968187, "to_serial": 2182968218},
+    {"from_serial": 2204289840, "to_serial": 2204289864},
+    {"from_serial": 2204289864, "to_serial": 56806203},
+    {"from_serial": 2182968218, "to_serial": 2182968242},
+    {"from_serial": 2526521020, "to_serial": 2526521058},
+    {"from_serial": 2526521020, "to_serial": 2526521026}
+  ],
+  "triggers": [
+    {"label": "ambiguous", "title": "正对点边界",
+     "description": "正对点边界（ambiguous）：增量 936405171 -> 3083888819 的前向距离恰为 2^31，RFC 1982 明确规定二者不可比较；该增量在 /transfer-plan、/retention-plan、/domain-retention-plan 与 /delta-consensus 均以 422 delta_not_strictly_newer 拒绝；副本 ns-1 锚定在该场景的关键序列号上（与目标 3083888819 相差 2^31），/audit 判定为 ambiguous 并阻塞发布，/propose 对此状态返回 409。",
+     "deltas": [{"from_serial": 936405171, "to_serial": 3083888819,
+                 "forward_distance": 2147483648, "relation": "ambiguous"}],
+     "replica": "ns-1"},
+    {"label": "fork", "title": "分叉边界",
+     "description": "分叉边界（fork）：同一 from_serial=2526521020 同时指向 2526521026 与 2526521058，两条边单独看都是 RFC 1982 严格推进，但 /transfer-plan 与 /retention-plan 对无序增量做整体校验时以 422 delta_fork 拒绝（增量链不允许分叉、不静默选边）；副本 ns-2 锚定在该场景的关键序列号上（分叉起点）。",
+     "deltas": [
+       {"from_serial": 2526521020, "to_serial": 2526521026,
+        "forward_distance": 6, "relation": "newer"},
+       {"from_serial": 2526521020, "to_serial": 2526521058,
+        "forward_distance": 38, "relation": "newer"}],
+     "replica": "ns-2"},
+    {"label": "loop", "title": "环路边界",
+     "description": "环路边界（loop）：增量 2204289864 -> 56806203 前向距离 2147483635、56806203 -> 2204289840 前向距离 2147483637、2204289840 -> 2204289864 前向距离 24，三条边各自都是 RFC 1982 严格 newer，但距离之和恰为 2^32 构成回绕环（两条严格 newer 边的距离之和至多 2^32-2，故合法环至少需要三条边）；/transfer-plan 沿边行进会回到已访问序列号，副本 ns-3 锚定在该场景的关键序列号上（环上节点），经该结构到目标的副本一律以 axfr / loop 终止。",
+     "deltas": [
+       {"from_serial": 2204289864, "to_serial": 56806203,
+        "forward_distance": 2147483635, "relation": "newer"},
+       {"from_serial": 56806203, "to_serial": 2204289840,
+        "forward_distance": 2147483637, "relation": "newer"},
+       {"from_serial": 2204289840, "to_serial": 2204289864,
+        "forward_distance": 24, "relation": "newer"}],
+     "replica": "ns-3"},
+    {"label": "wrap", "title": "回绕边界",
+     "description": "回绕边界（wrap）：增量 4294967292 -> 2 越过 2^32-1 回绕到 2，前向距离仅 6，按 RFC 1982 判定为 newer，是合法的严格推进（可作为 IXFR 链上的回绕一跳）；副本 ns-4 锚定在该场景的关键序列号上，对回绕后继的 /audit 同样判定为 newer。",
+     "deltas": [{"from_serial": 4294967292, "to_serial": 2,
+                 "forward_distance": 6, "relation": "newer"}],
+     "replica": "ns-4"}
+  ]
+}
+```
+
+> 上例 `deltas` 中除四类触发增量（7 条）外，`2182968187 -> 2182968218
+> -> 2182968242` 即自动追加的普通背景增量链。把响应中的 `replicas` /
+> `target` / `deltas` 直接组装即可调用 `/audit`、`/transfer-plan` 等接口
+> 复现触发点所述判定。
+
+只选部分标签、并要求场景数少于候选数时，按规范顺序取最靠前的场景：
+
+```bash
+curl -s http://localhost:8000/serial-scenarios/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"seed": 7, "replica_count": 2, "scenario_count": 2,
+       "include": ["wrap", "loop"]}'
+# scenarios: ["loop", "wrap"]（include 回显亦按规范顺序排列）
+```
+
+非法参数返回 **422**：`scenario_count` 超过 `include` 去重标签数
+（`scenario_count_exceeds_include`）、`include` 含重复标签
+（`duplicate_scenario_label`）或未知标签、`seed` 越界 / 类型错误、
+`replica_count` 超出 `1..12`、`scenario_count` 超出 `1..4` 等：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8000/serial-scenarios/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"seed": 1, "replica_count": 2, "scenario_count": 3,
+       "include": ["wrap", "loop"]}'
+# 422
+```
+
 ### 输入校验（422）
 
 以下情况返回 **422 Unprocessable Entity**：
@@ -959,6 +1094,12 @@ curl -s http://localhost:8000/delta-consensus \
   `from_serial` 上报不同 `to_serial` 或不同 `digest` 返回 422
   （`mirror_version_conflict`，返回冲突的两份完整上报），完全相同的三元组
   重复合法并去重；镜像名重复（`duplicate_replica_name`）同样返回 422。
+- `/serial-scenarios/generate` 额外检查：`seed` 必须是 `[0, 4294967295]`
+  内的整数；`replica_count` 必须在 `1..12`、`scenario_count` 必须在 `1..4`；
+  `include` 必须为非空数组且元素只能是 `wrap` / `ambiguous` / `fork` /
+  `loop`（未知标签、非字符串返回 422）；`include` 含重复标签返回 422
+  （`duplicate_scenario_label`）；`scenario_count` 超过 `include` 去重后的
+  标签数返回 422（`scenario_count_exceeds_include`）。
 
 ## 算法说明
 
@@ -1057,6 +1198,29 @@ priority 作为常量并入各域基值；对每个可行子集统计各域被�
 （含票数与可信摘要对照）、其余上报为 `extra_edges`（含票数），各列表内部
 统一按三元组 / 序号对升序，连同 `voters` 名称升序，相同输入恒得相同结果。
 
+`/serial-scenarios/generate` 不依赖系统随机源：以请求 `seed` 初始化内置的
+64 位 SplitMix64 生成器（`state += 9E3779B97F4A7C15 (mod 2⁶⁴)` 后做两轮
+乘异或混淆），有界取数使用 Lemire 拒绝采样消除模偏差，乱序使用
+Fisher–Yates——相同种子在任意 Python 版本 / 平台上产生相同整数序列。
+场景按固定规范顺序 `ambiguous → fork → loop → wrap` 构建（与 `include`
+的给出顺序无关），先构建的结构把其序列号登记到保留集合，后构建者采样时
+主动避开，保证四类边界互不串味：
+
+- `ambiguous` 不消耗随机性来定位边界：目标先行随机确定后，锚点直接取
+  `(target − 2³¹) mod 2³²`，故锚点与目标的前向距离**恒为** 2³¹；
+- `fork` 采样一个远离所有保留序列号的起点，再接两条 `[1, 32]` 内的短边；
+- `loop` 采样起点 `s1` 与两个小回退量 `r1, r2`，三段距离取
+  `d1 = 2³¹−1−r1`、`d2 = 2³¹−1−r2`、`d3 = 2+r1+r2`，三者均在严格 newer
+  区间且和恰为 2³²，形成 `s1 → s2 → s3 → s1` 的三跳回绕环（两条严格
+  newer 边的距离之和至多 2³²−2，故两跳不可能成环）；
+- `wrap` 从 `[2³²−8, 2³²−1]` 取起点、以 `[1, 8]` 的小步长推进越过回绕点；
+- 最后追加一条 1–4 跳、全程不回绕的普通背景增量链，并把副本锚点
+  （按规范顺序占用 `ns-1` 起的槽位）之外的副本序列号在避开全部锚点 /
+  目标的前提下随机补齐，整体增量集合经 Fisher–Yates 乱序后作为无序样本
+  输出。全部采样带固定重试上限（冲突概率相对 2³² 可忽略），连同固定的
+  场景顺序与排序规则，相同请求的场景标签、副本、目标、增量与触发点说明
+  完全可复现。
+
 ## 测试
 
 核心环形算术不依赖 FastAPI，可直接用标准库运行（另含小位宽空间对暴力穷举的对照测试，
@@ -1075,7 +1239,11 @@ covered/total 汇总与稳定性测试，以及 `/rollout-gate` 的时间戳排�
 的严格推进 / 单镜像版本冲突校验、完整三元组计票与同镜像去重、摘要分票、
 缺口 / 分叉（含同序号对双可信摘要）/ 环路（纯环与带尾环）/ 回绕链组装、
 最长链选择与确定性平局、目标可达性（链中间、分叉点、分支后、纯环）、
-逐镜像缺失 / 少数摘要 / 额外边证据与稳定排序、422 路由测试）：
+逐镜像缺失 / 少数摘要 / 额外边证据与稳定排序、422 路由测试，
+以及 `/serial-scenarios/generate` 的 SplitMix64 确定性与无偏采样、
+相同请求 / include 顺序无关的可复现性、32 位范围与数量限制、
+wrap 回绕 / ambiguous 正对点 / fork 分叉 / loop 三跳回绕环边界语义、
+四类结构共存与锚点槽位、422 路由测试）：
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -1089,13 +1257,16 @@ python3 -m unittest discover -s tests -v
 │   ├── __init__.py
 │   ├── main.py        # FastAPI 路由与异常（/audit、/propose、/transfer-plan、
 │   │                  #   /retention-plan、/domain-retention-plan、/rollout-gate、
-│   │                  #   /propagation-slo、/divergence-windows、/delta-consensus）
+│   │                  #   /propagation-slo、/divergence-windows、/delta-consensus、
+│   │                  #   /serial-scenarios/generate）
 │   ├── schemas.py     # 请求/响应模型与 422 校验（含 /rollout-gate、
-│   │                  #   /propagation-slo、/divergence-windows 与 /delta-consensus
-│   │                  #   的 OpenAPI 示例）
-│   └── serial.py      # RFC 1982 环形算术、增量链规划、保留规划、上线门禁
-│                      #   与传播 SLO 评估、分裂窗口扫掠、增量共识
-│                      #   （纯函数，零第三方依赖）
+│   │                  #   /propagation-slo、/divergence-windows、/delta-consensus
+│   │                  #   与 /serial-scenarios/generate 的 OpenAPI 示例）
+│   ├── serial.py      # RFC 1982 环形算术、增量链规划、保留规划、上线门禁
+│   │                  #   与传播 SLO 评估、分裂窗口扫掠、增量共识
+│   │                  #   （纯函数，零第三方依赖）
+│   └── scenarios.py   # 确定性场景生成：SplitMix64 随机源与 wrap / ambiguous /
+│                      #   fork / loop 边界样本构建（纯函数，零第三方依赖）
 ├── tests/test_serial.py
 ├── tests/test_transfer_plan.py
 ├── tests/test_retention_plan.py
@@ -1104,6 +1275,7 @@ python3 -m unittest discover -s tests -v
 ├── tests/test_propagation_slo.py
 ├── tests/test_divergence_windows.py
 ├── tests/test_delta_consensus.py
+├── tests/test_serial_scenarios.py
 ├── requirements.txt
 ├── Dockerfile
 ├── compose.yaml
