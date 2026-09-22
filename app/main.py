@@ -45,6 +45,9 @@ from .schemas import (
     RolloutGateResponse,
     RolloutInterval,
     RolloutReplicaItem,
+    SerialScenario,
+    SerialScenarioGenerateRequest,
+    SerialScenarioGenerateResponse,
     TransferPlanItem,
     TransferPlanRequest,
     TransferPlanResponse,
@@ -72,6 +75,7 @@ from .serial import (
     ReleaseOrderError,
     validate_mirror_reports,
 )
+from .scenarios import generate_serial_scenarios
 
 app = FastAPI(
     title="DNS SOA 序列号推进审计 API",
@@ -82,9 +86,10 @@ app = FastAPI(
         "并按时间序列观测对上线做 quorum 门禁判定、"
         "评估每次发布在各故障域间的传播收敛时延（SLO），"
         "沿时间线检测各副本序列号无可共同推进候选的分裂窗口，"
-        "以及对多镜像上报的 IXFR 增量按完整三元组做法定人数共识审计。"
+        "对多镜像上报的 IXFR 增量按完整三元组做法定人数共识审计，"
+        "并可确定性生成覆盖回绕 / 正对点 / 分叉 / 环路边界的可复现场景样本。"
     ),
-    version="1.6.0",
+    version="1.7.0",
 )
 
 
@@ -767,4 +772,49 @@ def delta_consensus(request: DeltaConsensusRequest) -> DeltaConsensusResponse:
             )
             for item in outcome["mirrors"]
         ],
+    )
+
+
+@app.post(
+    "/serial-scenarios/generate",
+    response_model=SerialScenarioGenerateResponse,
+)
+def serial_scenarios_generate(
+    request: SerialScenarioGenerateRequest,
+) -> SerialScenarioGenerateResponse:
+    """确定性生成 RFC 1982 边界场景（相同请求参数恒得相同标签与数值）。
+
+    以请求中的 ``seed`` 为根种子，用标准库 ``random.Random`` 为每个场景
+    派生独立伪随机流（仅做整数混合播种，不依赖按进程加盐的哈希），生成
+    32 位范围内的副本当前序列号、目标与**已洗牌的无序** IXFR 增量样本，
+    覆盖四类边界：
+
+    * ``wrap``：增量与部分副本的推进跨过 ``2^32-1`` 回绕点
+      （``4294967295 -> 0`` 前向距离为 1，仍严格 newer）；
+    * ``ambiguous``：某副本当前值与目标前向距离恰为 ``2^31``（正对点，
+      RFC 1982 不可比较，喂给 /audit 为 ambiguous、/transfer-plan 即使有
+      连通边也降级 axfr / target_incomparable）；
+    * ``fork``：同一 from_serial 指向两个不同 to_serial（喂给 /transfer-plan
+      等端点返回 422 delta_fork）；
+    * ``loop``：三条严格 newer 边前向距离之和恰为 ``2^32`` 的跨回绕闭环
+      （严格 newer 环至少需 3 条边；/transfer-plan 判 axfr / loop）。
+
+    场景标签按 ``include`` 的请求顺序轮转铺到 ``scenario_count`` 个位置，
+    与 seed 无关；``replica_count ∈ [1, 12]``、``scenario_count ∈ [1, 32]``、
+    ``seed ∈ [0, 2^32-1]``，include 为非空无重复标签子集，越界返回 422。
+    每个场景返回 ``replicas`` / ``target`` / ``deltas``（无序样本，可原样
+    POST 给现有端点）与 ``trigger_points``（命中的边界条件及预期触发行为）。
+    """
+    scenarios = generate_serial_scenarios(
+        seed=request.seed,
+        replica_count=request.replica_count,
+        scenario_count=request.scenario_count,
+        include=request.include,
+    )
+    return SerialScenarioGenerateResponse(
+        seed=request.seed,
+        replica_count=request.replica_count,
+        scenario_count=request.scenario_count,
+        include=request.include,
+        scenarios=[SerialScenario.model_validate(item) for item in scenarios],
     )

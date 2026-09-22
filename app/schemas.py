@@ -17,6 +17,7 @@ from .serial import (
     IXFR,
     UP_TO_DATE,
 )
+from .scenarios import MAX_SCENARIO_COUNT, MAX_SCENARIO_REPLICAS, SCENARIO_LABELS
 
 Serial32 = Annotated[int, Field(ge=0, le=MAX_SERIAL)]
 Relation = Literal["newer", "equal", "older", "ambiguous"]
@@ -1268,3 +1269,181 @@ class DeltaConsensusResponse(BaseModel):
     mirrors: List[ConsensusMirrorEvidence] = Field(
         ..., description="逐镜像证据（顺序与请求中的镜像一致）",
     )
+
+
+# ---------------------------------------------------------------------------
+# POST /serial-scenarios/generate
+# ---------------------------------------------------------------------------
+
+ScenarioLabel = Literal["wrap", "ambiguous", "fork", "loop"]
+
+
+class SerialScenarioGenerateRequest(BaseModel):
+    """POST /serial-scenarios/generate 请求体。"""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "seed": 20240921,
+                    "replica_count": 3,
+                    "scenario_count": 4,
+                    "include": ["wrap", "ambiguous", "fork", "loop"],
+                },
+                {
+                    "seed": 7,
+                    "replica_count": 2,
+                    "scenario_count": 6,
+                    "include": ["wrap", "loop"],
+                },
+            ]
+        }
+    )
+
+    seed: int = Field(
+        ...,
+        ge=0,
+        le=MAX_SERIAL,
+        description=(
+            "伪随机数种子（32 位无符号整数 [0, 4294967295]）；相同 seed 与其余"
+            "参数恒得相同场景标签、副本值与增量样本"
+        ),
+    )
+    replica_count: int = Field(
+        ...,
+        ge=1,
+        le=MAX_SCENARIO_REPLICAS,
+        description=f"每个场景生成的副本数（[1, {MAX_SCENARIO_REPLICAS}]）",
+    )
+    scenario_count: int = Field(
+        ...,
+        ge=1,
+        le=MAX_SCENARIO_COUNT,
+        description=(
+            f"生成的场景数（[1, {MAX_SCENARIO_COUNT}]）；标签按 include 顺序"
+            "轮转铺满，故 include 中每个标签在前 len(include) 个场景至少出现一次"
+        ),
+    )
+    include: List[ScenarioLabel] = Field(
+        ...,
+        min_length=1,
+        max_length=len(SCENARIO_LABELS),
+        description=(
+            "要生成的场景标签子集（非空、不可重复），顺序决定轮转铺放顺序："
+            "wrap（跨 2^32-1 回绕）、ambiguous（前向距离恰为 2^31 的正对点）、"
+            "fork（同一 from_serial 指向两个 to_serial）、"
+            "loop（三条严格 newer 边距离之和恰为 2^32 的跨回绕环路）"
+        ),
+    )
+
+    @field_validator("seed", mode="before")
+    @classmethod
+    def _seed_serial32(cls, value: object) -> int:
+        return _coerce_serial32(value)
+
+    @field_validator("replica_count", "scenario_count", mode="before")
+    @classmethod
+    def _count_positive_int(cls, value: object) -> int:
+        # 区间上下界由 Field 的 ge / le 负责，这里只保证是真正的 int
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("数量参数必须是整数")
+        return value
+
+    @field_validator("include")
+    @classmethod
+    def _include_no_duplicates(cls, value: List[str]) -> List[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("include 中的场景标签不能重复")
+        return value
+
+
+class ScenarioReplica(BaseModel):
+    """场景中一个副本的当前序列号（名称由生成器固定为 ns-1..ns-N）。"""
+
+    name: str
+    current: int = Field(..., description="当前 32 位无符号 SOA 序列号")
+
+
+class ScenarioDelta(BaseModel):
+    """一条无序 IXFR 增量样本（生成顺序已随机洗牌）。"""
+
+    from_serial: int
+    to_serial: int
+
+
+class ScenarioTriggerPoint(BaseModel):
+    """触发点说明：本场景中命中的 RFC 1982 边界条件。
+
+    ``kind`` 区分类型，其余字段按类型出现（与类型无关的字段为 null）：
+
+    * ``wrap_edge`` / ``wrap_advance``：跨回绕点增量 / 副本推进；
+    * ``antipodal_pair`` / ``comparable_reference``：正对点副本 / 可比较对照副本；
+    * ``fork``：同一起点的两条分叉边（``to_serials``）；
+    * ``loop``：闭环节点序列与各边前向距离；``loop_edge``：单条环路边。
+    """
+
+    kind: str = Field(
+        ...,
+        description=(
+            "触发点类型：wrap_edge / wrap_advance / antipodal_pair / "
+            "comparable_reference / fork / loop / loop_edge"
+        ),
+    )
+    message: str = Field(
+        ..., description="人类可读的触发点说明（边界条件与喂给对应端点后的预期行为）",
+    )
+    replica: Optional[str] = Field(
+        None, description="触发该边界条件的副本名（与副本无关的触发点为 null）",
+    )
+    current: Optional[int] = Field(None, description="该副本当前序列号")
+    target: Optional[int] = Field(None, description="目标序列号")
+    from_serial: Optional[int] = Field(None, description="触发增量的起始序列号")
+    to_serial: Optional[int] = Field(None, description="触发增量的目标序列号")
+    to_serials: Optional[List[int]] = Field(
+        None, description="fork：同一 from_serial 指向的两个不同 to_serial",
+    )
+    nodes: Optional[List[int]] = Field(
+        None, description="loop：闭环节点序列（按行进方向）",
+    )
+    forward_distances: Optional[List[int]] = Field(
+        None, description="loop：各环路边的前向距离（与 nodes 配对循环）",
+    )
+    forward_distance: Optional[int] = Field(
+        None,
+        ge=1,
+        le=MAX_SERIAL,
+        description="该触发点涉及的前向模距离（wrap_edge 为 1、正对点为 2^31）",
+    )
+
+
+class SerialScenario(BaseModel):
+    """一个可复现的 RFC 1982 边界场景。"""
+
+    index: int = Field(..., ge=0, description="场景下标（从 0 开始）")
+    label: ScenarioLabel
+    replicas: List[ScenarioReplica] = Field(
+        ..., description="各副本当前序列号（顺序固定，名称 ns-1..ns-N）",
+    )
+    target: int = Field(..., description="目标 32 位无符号 SOA 序列号")
+    deltas: List[ScenarioDelta] = Field(
+        ...,
+        description=(
+            "无序 IXFR 增量样本（已随机洗牌，可原样 POST 给 /transfer-plan "
+            "等端点；fork 场景会被整体校验拒绝为 422 delta_fork）"
+        ),
+    )
+    trigger_points: List[ScenarioTriggerPoint] = Field(
+        ..., description="本场景命中的边界条件与喂给现有端点后的预期触发行为",
+    )
+
+
+class SerialScenarioGenerateResponse(BaseModel):
+    """POST /serial-scenarios/generate 响应体。"""
+
+    seed: int
+    replica_count: int
+    scenario_count: int
+    include: List[ScenarioLabel] = Field(
+        ..., description="回显请求的场景标签顺序（轮转铺放顺序）",
+    )
+    scenarios: List[SerialScenario]
